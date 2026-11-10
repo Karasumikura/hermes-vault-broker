@@ -1,0 +1,12 @@
+name: hermes-vault-broker
+version: 0.1.0
+description: "Fill saved logins from an out-of-process credential broker. The broker runs as its own user, keeps a passphrase-derived key in mlock'd memory, and writes the password into the page itself over CDP — the agent sends only (handle, origin) over a unix socket and receives a fill count. The vault key never sits next to its ciphertext and never enters the agent process."
+author: Karasumikura
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - vault_broker_status
+  - vault_broker_list
+  - vault_broker_fill
+provides_hooks: []

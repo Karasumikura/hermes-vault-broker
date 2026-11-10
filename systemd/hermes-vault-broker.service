@@ -1,0 +1,46 @@
+[Unit]
+Description=Hermes credential vault broker
+Documentation=https://github.com/Karasumikura/hermes-vault-broker
+After=network.target
+
+[Service]
+Type=simple
+User=vaultd
+Group=vaultd
+WorkingDirectory=/opt/hermes-vault-broker
+
+# /run/hermes-vault-broker is created owned by vaultd (the socket lives there);
+# /var/lib/hermes-vault-broker holds the store and the operator's TLS certificate.
+RuntimeDirectory=hermes-vault-broker
+RuntimeDirectoryMode=0750
+StateDirectory=hermes-vault-broker
+StateDirectoryMode=0700
+
+ExecStart=/opt/hermes-vault-broker/venv/bin/python -m broker \
+    --socket /run/hermes-vault-broker/sock \
+    --state /var/lib/hermes-vault-broker/store.json \
+    daemon
+
+Restart=on-failure
+RestartSec=2
+
+# The broker must not be able to reach the agent's home, which is where the
+# agent's own files live; and it must not be able to reach the network beyond
+# the browser's DevTools endpoint on loopback.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# The data key is pinned in RAM: without this, swap can carry it to disk.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-vault-broker"
+version = "0.1.0"
+description = "Out-of-process credential broker for Hermes Agent: the agent asks, the broker fills."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "cryptography>=42,<47",
+    "websockets>=13,<16",
+]
+
+[project.urls]
+Homepage = "https://github.com/Karasumikura/hermes-vault-broker"
+
+[tool.setuptools]
+packages = ["broker"]
