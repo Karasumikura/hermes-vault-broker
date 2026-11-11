@@ -16,6 +16,7 @@ Security shape:
 from __future__ import annotations
 
 import argparse
+import hmac
 import os
 import ssl
 import sys
@@ -24,6 +25,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs
 
 from .client import BrokerUnavailable, call
+
+# The form has exactly one field. Reject oversized (or malformed) bodies before
+# reading them so a remote caller cannot make us buffer an arbitrary amount.
+MAX_POST_BYTES = 4096
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -77,7 +82,10 @@ def main(argv: list[str] | None = None) -> int:
 
         def _token_ok(self) -> bool:
             query = self.path.split("?", 1)[-1] if "?" in self.path else ""
-            return parse_qs(query).get("t", [""])[0] == token
+            supplied = parse_qs(query).get("t", [""])[0]
+            # compare_digest only accepts ASCII str; encode so a non-ASCII token
+            # cannot raise TypeError and turn into a 500.
+            return hmac.compare_digest(supplied.encode("utf-8", "replace"), token.encode("ascii"))
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             if not self._token_ok():
@@ -89,7 +97,14 @@ def main(argv: list[str] | None = None) -> int:
             if not self._token_ok():
                 self._send("<h2>link expired</h2>", 403)
                 return
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send("<h2>bad request</h2>", 400)
+                return
+            if length < 0 or length > MAX_POST_BYTES:
+                self._send("<h2>request too large</h2>", 413)
+                return
             body = self.rfile.read(length)
             passphrase = parse_qs(body.decode("utf-8", "replace")).get("pw", [""])[0]
             if not passphrase:

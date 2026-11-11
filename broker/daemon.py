@@ -8,10 +8,15 @@ Wire format is one JSON object per line in each direction. Ops:
     {"op": "list"}                         -> {"ok": true, "items": [...]}
     {"op": "add", ...}                     -> {"ok": true, "handle": "vault_..."}
     {"op": "remove", "handle": "..."}      -> {"ok": true, "removed": bool}
-    {"op": "fill", "handle": "...", "origin": "...", "cdp": "...", "submit": bool}
+    {"op": "fill", "handle": "...", "origin": "...", "submit": bool}
                                            -> {"ok": true, "filled": 1, "submitted": false}
 
-A caller may only be the broker's own uid or root (``SO_PEERCRED``). The
+The DevTools endpoint is NOT part of the wire protocol: it is read by the broker
+from a root-owned config file and validated as loopback. A request that tries to
+supply one is refused, so a prompt-injected agent cannot repoint the write.
+
+Only ``status/list/fill`` are available to the gateway uid; ``init/unlock/lock/
+add/remove`` stay with root and the broker's own uid (``SO_PEERCRED``). The
 password never appears in a response, a log line, or an error message.
 """
 
@@ -29,6 +34,7 @@ import threading
 import time
 
 from . import cdp as cdp_module
+from .endpoint import DEFAULT_CONFIG_PATH, Endpoint, EndpointError, load_config
 from .store import LockedError, Store, VaultError
 
 log = logging.getLogger("hermes-vault-broker")
@@ -36,6 +42,10 @@ log = logging.getLogger("hermes-vault-broker")
 DEFAULT_SOCKET = "/run/hermes-vault-broker/sock"
 DEFAULT_STATE = "/var/lib/hermes-vault-broker/store.json"
 MAX_LINE = 64 * 1024
+
+# The gateway uid gets these and nothing else. Everything that changes the
+# store or unlocks it is reserved for root / the broker's own uid.
+GATEWAY_OPS = frozenset(("status", "list", "fill"))
 
 # Brute-force brake: after this many wrong passphrases the daemon stops
 # answering unlock for a while, so a compromised agent cannot grind offline.
@@ -55,9 +65,18 @@ def peer_uid(sock: socket.socket) -> int:
 class Broker:
     """Request handling, separated from the socket so tests can call it directly."""
 
-    def __init__(self, store: Store, allowed_uids: tuple[int, ...] = (0,)):
+    def __init__(
+        self,
+        store: Store,
+        allowed_uids: tuple[int, ...] = (0,),
+        admin_uids: tuple[int, ...] | None = None,
+        endpoint: Endpoint | None = None,
+    ):
         self.store = store
         self.allowed_uids = tuple(allowed_uids)
+        # Only root and the broker's own uid may mutate or unlock the store.
+        self.admin_uids = tuple(admin_uids) if admin_uids is not None else (0, os.getuid())
+        self.endpoint = endpoint
         self._failures = 0
         self._blocked_until = 0.0
         self._mutex = threading.Lock()
@@ -68,6 +87,9 @@ class Broker:
             log.warning("rejected request from uid %s", uid)
             return {"ok": False, "error": "not permitted"}
         op = str(request.get("op") or "")
+        if uid not in self.admin_uids and op not in GATEWAY_OPS:
+            log.warning("uid %s attempted privileged op %s", uid, op)
+            return {"ok": False, "error": "not permitted"}
         handler = getattr(self, "_op_" + op, None)
         if handler is None:
             return {"ok": False, "error": "unknown op %r" % op}
@@ -150,13 +172,20 @@ class Broker:
         return {"ok": True, "removed": removed}
 
     def _op_fill(self, request: dict) -> dict:
+        # A model-supplied endpoint was the original exfiltration path. Reject it
+        # outright rather than silently ignoring it, so a stale or injected client
+        # fails loudly.
+        if "cdp" in request:
+            return {"ok": False, "error": "cdp is not accepted; the broker owns its DevTools endpoint"}
+        if self.endpoint is None:
+            return {"ok": False, "error": "no DevTools endpoint configured"}
         handle = request.get("handle") or ""
         origin = request.get("origin") or ""
         meta, password = self.store.resolve(handle, origin)
         result = cdp_module.fill_login(
             origin=meta.origin,
             password=password,
-            cdp_url=request.get("cdp") or cdp_module.DEFAULT_CDP,
+            endpoint=self.endpoint,
             submit=bool(request.get("submit")),
         )
         log.info("filled %s on %s (%s fields)", meta.id, meta.origin, result.get("filled"))
@@ -208,9 +237,14 @@ class Server(socketserver.ThreadingUnixStreamServer):
         super().process_request(request, client_address)
 
 
-def serve(socket_path: str, state_path: str, allowed_uids: tuple[int, ...]) -> None:
+def serve(
+    socket_path: str,
+    state_path: str,
+    allowed_uids: tuple[int, ...],
+    endpoint: Endpoint,
+) -> None:
     store = Store(state_path)
-    broker = Broker(store, allowed_uids=allowed_uids)
+    broker = Broker(store, allowed_uids=allowed_uids, endpoint=endpoint)
     server = Server(socket_path, broker)
     log.info("listening on %s (state %s)", socket_path, state_path)
     try:
@@ -224,11 +258,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--state", default=DEFAULT_STATE)
     parser.add_argument(
+        "--cdp-config",
+        default=DEFAULT_CONFIG_PATH,
+        help="root-owned JSON file holding the loopback DevTools endpoint",
+    )
+    parser.add_argument(
         "--allow-uid",
         action="append",
         type=int,
         default=None,
-        help="uid allowed to call the broker (default: root and the broker's own uid)",
+        help="uid allowed to call status/list/fill (the Hermes gateway uid)",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -236,9 +275,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    allowed = tuple(args.allow_uid) if args.allow_uid else (0, os.getuid())
     try:
-        serve(args.socket, args.state, allowed)
+        endpoint = load_config(args.cdp_config)
+    except EndpointError as exc:
+        log.error("refusing to start: %s", exc)
+        return 2
+    admins = (0, os.getuid())
+    allowed = tuple(dict.fromkeys(admins + tuple(args.allow_uid or [])))
+    try:
+        serve(args.socket, args.state, allowed, endpoint)
     except KeyboardInterrupt:
         return 0
     return 0

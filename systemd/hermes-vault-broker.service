@@ -11,15 +11,22 @@ WorkingDirectory=/opt/hermes-vault-broker
 
 # /run/hermes-vault-broker is created owned by vaultd (the socket lives there);
 # /var/lib/hermes-vault-broker holds the store and the operator's TLS certificate.
+# 0750 + vaultd group lets the Hermes user reach the socket; install.sh adds it
+# to that group and writes BROKER_ALLOW_UID below.
 RuntimeDirectory=hermes-vault-broker
 RuntimeDirectoryMode=0750
 StateDirectory=hermes-vault-broker
 StateDirectoryMode=0700
 
+# root-owned daemon.env supplies the single unprivileged uid allowed to call
+# status/list/fill. Missing file = service refuses to start (fail closed).
+EnvironmentFile=/etc/hermes-vault-broker/daemon.env
+
 ExecStart=/opt/hermes-vault-broker/venv/bin/python -m broker \
     --socket /run/hermes-vault-broker/sock \
     --state /var/lib/hermes-vault-broker/store.json \
-    daemon
+    daemon --cdp-config /etc/hermes-vault-broker/cdp.json \
+           --allow-uid ${BROKER_ALLOW_UID}
 
 Restart=on-failure
 RestartSec=2
@@ -40,7 +47,8 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 
 # The data key is pinned in RAM: without this, swap can carry it to disk.
-LimitMEMLOCK=infinity
+# A handful of pages is enough for the 32-byte DEK; no need for infinity.
+LimitMEMLOCK=1M
 
 [Install]
 WantedBy=multi-user.target

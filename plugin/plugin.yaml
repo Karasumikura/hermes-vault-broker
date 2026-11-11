@@ -1,6 +1,6 @@
 name: hermes-vault-broker
 version: 0.1.0
-description: "Fill saved logins from an out-of-process credential broker. The broker runs as its own user, keeps a passphrase-derived key in mlock'd memory, and writes the password into the page itself over CDP — the agent sends only (handle, origin) over a unix socket and receives a fill count. The vault key never sits next to its ciphertext and never enters the agent process."
+description: "Fill saved logins from an out-of-process credential broker. The broker runs as its own user, keeps its random data key (DEK) in checked mlock'd memory, and writes the password into the page itself over a DevTools endpoint read from its own root-owned loopback config (never from the model). The agent sends only (handle, origin) over a unix socket and receives a fill count. Per-op SO_PEERCRED checks give the gateway uid status/list/fill only, and every tab websocket is matched against the pinned endpoint before anything is written. Linux; stdlib unittest suite; deps cryptography + websockets."
 author: Karasumikura
 kind: standalone
 platforms:

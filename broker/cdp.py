@@ -3,15 +3,24 @@
 The broker does the write itself: it finds the tab whose origin matches the
 item, asks that tab to run one self-contained script that re-asserts the origin
 and sets the password, and reports only a count. The caller never sees a value.
+
+The endpoint is never a request parameter. It comes from the broker's own
+root-owned config (:mod:`broker.endpoint`); this module refuses non-loopback
+endpoints, refuses redirects, and refuses any ``webSocketDebuggerUrl`` whose
+host:port differs from the configured endpoint *before* the password is sent.
 """
 
 from __future__ import annotations
 
+import http.client
+import inspect
 import json
-import urllib.request
 from urllib.parse import urlsplit
 
-DEFAULT_CDP = "http://127.0.0.1:9223"
+from .endpoint import Endpoint, EndpointError, validate_ws_url
+
+# Cap the /json/list response so the broker always reads a bounded amount.
+MAX_TABS_BYTES = 1024 * 1024
 
 
 class CdpError(Exception):
@@ -19,15 +28,26 @@ class CdpError(Exception):
 
 
 def origin_of(url: str) -> str:
-    parts = urlsplit(url or "")
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(url or "")
+        scheme = (parts.scheme or "").lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        # A malicious tab can put an invalid port in its URL; that is not a
+        # reason to let a ValueError escape into the daemon's generic handler.
+        return ""
     if not scheme or not host:
         return ""
-    port = parts.port
     if port is None or port == {"http": 80, "https": 443}.get(scheme):
         return "%s://%s" % (scheme, host)
     return "%s://%s:%d" % (scheme, host, port)
+
+
+def _safe_message(value, limit: int = 160) -> str:
+    """Text controlled by a tab/endpoint, bounded before it reaches the agent."""
+    text = value if isinstance(value, str) else str(value)
+    return " ".join(text.split())[:limit]
 
 
 _FILL_JS = """(() => {
@@ -63,33 +83,64 @@ _FILL_JS = """(() => {
 })()"""
 
 
-def list_tabs(cdp_url: str = DEFAULT_CDP) -> list[dict]:
-    url = cdp_url.rstrip("/") + "/json/list"
+def list_tabs(endpoint: Endpoint) -> list[dict]:
+    """Fetch ``/json/list`` over a direct loopback connection.
+
+    ``http.client`` is deliberate: no urllib opener, so there is no environment
+    proxy to honour and no redirect handler to follow. Only the validated
+    endpoint's host/port is ever dialled.
+    """
+    if not isinstance(endpoint, Endpoint):
+        raise CdpError("no validated DevTools endpoint configured")
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            tabs = json.load(response)
+        conn = http.client.HTTPConnection(endpoint.host, endpoint.port, timeout=5)
+        try:
+            conn.request("GET", "/json/list")
+            response = conn.getresponse()
+            if response.status != 200:
+                raise CdpError(
+                    "the DevTools endpoint returned HTTP %d (redirects are not followed)" % response.status
+                )
+            raw = response.read(MAX_TABS_BYTES + 1)
+        finally:
+            conn.close()
+        if len(raw) > MAX_TABS_BYTES:
+            raise CdpError("the DevTools endpoint returned an oversized payload")
+        tabs = json.loads(raw)
+    except CdpError:
+        raise
     except Exception as exc:  # noqa: BLE001 - any transport failure is the same story for the caller
-        raise CdpError("cannot reach the browser DevTools endpoint at %s" % cdp_url) from exc
+        raise CdpError("cannot reach the configured DevTools endpoint") from exc
     if not isinstance(tabs, list):
         raise CdpError("DevTools endpoint returned an unexpected payload")
     return tabs
 
 
-def find_tab(origin: str, cdp_url: str = DEFAULT_CDP) -> dict:
+def find_tab(origin: str, endpoint: Endpoint) -> dict:
     wanted = origin.rstrip("/")
-    pages = [t for t in list_tabs(cdp_url) if t.get("type") == "page"]
+    pages = [t for t in list_tabs(endpoint) if t.get("type") == "page"]
     for tab in pages:
         if origin_of(tab.get("url", "")) == wanted:
             return tab
-    seen = ", ".join(sorted({origin_of(t.get("url", "")) for t in pages})) or "none"
+    seen = ", ".join(sorted({origin_of(t.get("url", "")) for t in pages})[:5])[:200] or "none"
     raise CdpError("no open tab on %s (open tabs: %s)" % (wanted, seen))
 
 
 def _evaluate(ws_url: str, expression: str, timeout: float = 15.0) -> dict:
     from websockets.sync.client import connect
 
+    # websockets >=14 defaults to proxy=True and honours http_proxy from the
+    # environment — that would bypass the loopback check even for a ws:// URL
+    # on 127.0.0.1. Disable the proxy when this version supports it; 13.x has
+    # no such argument (and no env-proxy support either).
+    kwargs = {"open_timeout": timeout, "close_timeout": 2, "max_size": None}
     try:
-        with connect(ws_url, open_timeout=timeout, close_timeout=2, max_size=None) as ws:
+        if "proxy" in inspect.signature(connect).parameters:
+            kwargs["proxy"] = None
+    except (TypeError, ValueError):  # pragma: no cover - exotic build
+        pass
+    try:
+        with connect(ws_url, **kwargs) as ws:
             ws.send(json.dumps({
                 "id": 1,
                 "method": "Runtime.evaluate",
@@ -108,21 +159,29 @@ def _evaluate(ws_url: str, expression: str, timeout: float = 15.0) -> dict:
 def fill_login(
     origin: str,
     password: str,
-    cdp_url: str = DEFAULT_CDP,
+    endpoint: Endpoint,
     submit: bool = False,
 ) -> dict:
     """Write *password* into the login form of the tab on *origin*.
 
-    Returns ``{"filled": n, "submitted": bool}``. Raises :class:`CdpError` when
-    the tab cannot be reached, the page moved off the origin, or no password
-    field matched — in every case nothing is written.
+    ``endpoint`` is the broker-owned, validated loopback endpoint, never a value
+    taken from a socket request. Returns ``{"filled": n, "submitted": bool}``.
+    Raises :class:`CdpError` when the tab cannot be reached, the page moved off
+    the origin, the advertised websocket is not the configured endpoint, or no
+    password field matched — in every case nothing is written.
     """
     if not password:
         raise CdpError("no password to fill")
-    tab = find_tab(origin, cdp_url)
+    if not isinstance(endpoint, Endpoint):
+        raise CdpError("no validated DevTools endpoint configured")
+    tab = find_tab(origin, endpoint)
     ws_url = tab.get("webSocketDebuggerUrl")
     if not ws_url:
         raise CdpError("the DevTools endpoint did not offer a websocket for this tab")
+    try:
+        ws_url = validate_ws_url(ws_url, endpoint)
+    except EndpointError as exc:
+        raise CdpError(str(exc)) from exc
 
     expression = _FILL_JS % {
         "origin": json.dumps(origin),
@@ -130,19 +189,32 @@ def fill_login(
         "submit": "true" if submit else "false",
     }
     reply = _evaluate(ws_url, expression)
+    if not isinstance(reply, dict):
+        raise CdpError("the DevTools endpoint returned an unexpected reply")
     if "error" in reply:
-        raise CdpError("DevTools error: %s" % (reply["error"].get("message") or "unknown"))
+        detail = reply["error"]
+        if isinstance(detail, dict):
+            detail = detail.get("message") or "unknown"
+        raise CdpError("DevTools error: %s" % _safe_message(detail))
     result = reply.get("result", {}).get("result", {})
+    if not isinstance(result, dict):
+        raise CdpError("the DevTools endpoint returned an unexpected result")
     raw = result.get("value")
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else {}
     except ValueError:
         raise CdpError("the page returned an unreadable result") from None
+    if not isinstance(parsed, dict):
+        raise CdpError("the page returned an unreadable result")
     if parsed.get("refused"):
         raise CdpError(
             "refused: the page is on %s, not %s — nothing was written"
-            % (parsed.get("found") or "unknown", origin)
+            % (_safe_message(parsed.get("found") or "unknown"), origin)
         )
     if parsed.get("error"):
-        raise CdpError(parsed["error"])
-    return {"filled": int(parsed.get("filled", 0)), "submitted": bool(parsed.get("submitted"))}
+        raise CdpError(_safe_message(parsed["error"]))
+    try:
+        filled = int(parsed.get("filled", 0))
+    except (TypeError, ValueError):
+        raise CdpError("the page returned an unreadable result") from None
+    return {"filled": filled, "submitted": bool(parsed.get("submitted"))}

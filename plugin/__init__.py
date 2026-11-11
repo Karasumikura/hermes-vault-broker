@@ -13,7 +13,6 @@ import socket
 
 SOCKET_ENV = "HERMES_VAULT_BROKER_SOCKET"
 DEFAULT_SOCKET = "/run/hermes-vault-broker/sock"
-DEFAULT_CDP = "http://127.0.0.1:9223"
 TIMEOUT_S = 30.0
 
 
@@ -23,11 +22,12 @@ def _socket_path() -> str:
 
 def _call(request: dict) -> dict:
     path = _socket_path()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(TIMEOUT_S)
         sock.connect(path)
     except OSError as exc:
+        sock.close()
         return {
             "ok": False,
             "error": "vault broker is not reachable at %s (%s). Start it with "
@@ -77,7 +77,6 @@ def _fill(args: dict, **_kwargs) -> str:
                 "op": "fill",
                 "handle": handle,
                 "origin": origin,
-                "cdp": str(args.get("cdp") or DEFAULT_CDP),
                 "submit": bool(args.get("submit")),
             }
         ),
@@ -99,9 +98,9 @@ _FILL_SCHEMA = {
                            "Must match the origin the login was saved for.",
         },
         "submit": {"type": "boolean", "description": "Submit the form after the password is written."},
-        "cdp": {"type": "string", "description": "DevTools endpoint of the browser holding the page. Default http://127.0.0.1:9223"},
     },
     "required": ["handle", "origin"],
+    "additionalProperties": False,
 }
 
 
@@ -134,6 +133,7 @@ def register(ctx) -> None:
         description=(
             "Fill the password of a saved login into the browser tab on the given origin. The broker "
             "resolves the secret and writes it itself, so the password never enters this process. "
+            "The DevTools endpoint is fixed by the broker's root-owned config and is not a parameter. "
             "Returns {filled, submitted}. Use submit=true to also submit the form. If the broker "
             "reports origin_mismatch or 'no open tab', navigate the browser to the login page first."
         ),

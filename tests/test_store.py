@@ -1,8 +1,10 @@
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -77,6 +79,51 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(VaultError):
             Store(os.path.join(self.tmp.name, "x.json")).create("short")
 
+    def test_dek_is_mlocked_and_wiped_on_lock(self):
+        key = self.store._dek
+        assert key is not None
+        self.assertTrue(key.locked)
+        buf = self.store._require_unlocked()
+        self.assertIsInstance(buf, bytearray)
+        self.assertIs(buf, key.buffer)  # no unlocked bytes copy on every op
+        self.store.lock()
+        self.assertFalse(key.locked)
+        self.assertIsNone(self.store._dek)
+
+    def test_unlock_mlocks_the_key_too(self):
+        fresh = Store(self.path)
+        fresh.unlock(PASS)
+        key = fresh._dek
+        assert key is not None
+        self.assertTrue(key.locked)
+        fresh.lock()
+
+    def test_mlock_failure_is_fatal_not_a_silent_downgrade(self):
+        from broker import store as store_module
+
+        with mock.patch.object(store_module, "_MLOCK", return_value=-1):
+            with self.assertRaises(VaultError) as caught:
+                Store(os.path.join(self.tmp.name, "blocked.json")).create(PASS)
+        self.assertIn("lock the data key", str(caught.exception))
+
+    def test_aesgcm_accepts_a_bytearray_key(self):
+        """The pinned dependency range must keep this behaviour: we pass the
+        mlock'd bytearray straight to AESGCM instead of copying it to bytes."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key = bytearray(b"0" * 32)
+        nonce = b"0" * 12
+        blob = AESGCM(key).encrypt(nonce, b"payload", b"aad")
+        self.assertEqual(AESGCM(key).decrypt(nonce, blob, b"aad"), b"payload")
+
+    def test_tampered_kdf_parameters_are_refused(self):
+        doc = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        doc["kdf"]["n"] = 2 ** 30
+        Path(self.path).write_text(json.dumps(doc), encoding="utf-8")
+        with self.assertRaises(VaultError) as caught:
+            Store(self.path).unlock(PASS)
+        self.assertIn("KDF parameters", str(caught.exception))
+
 
 class OriginTest(unittest.TestCase):
     def test_forms(self):
@@ -85,7 +132,7 @@ class OriginTest(unittest.TestCase):
         self.assertEqual(normalize_origin("http://example.com:8080/x"), "http://example.com:8080")
 
     def test_rejects_garbage(self):
-        for value in ("", "kaggle.com", "https://"):
+        for value in ("", "kaggle.com", "https://", "ftp://example.com", "https://user:pw@example.com"):
             with self.assertRaises(VaultError):
                 normalize_origin(value)
 

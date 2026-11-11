@@ -15,11 +15,12 @@ class BrokerUnavailable(Exception):
 
 def call(request: dict, socket_path: str = DEFAULT_SOCKET, timeout: float = 30.0) -> dict:
     payload = (json.dumps(request) + "\n").encode("utf-8")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect(socket_path)
     except OSError as exc:
+        sock.close()
         raise BrokerUnavailable(
             "vault broker is not reachable at %s (%s)" % (socket_path, type(exc).__name__)
         ) from exc

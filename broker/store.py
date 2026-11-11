@@ -14,6 +14,7 @@ point: a copy of the file is not a copy of the credentials.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -30,6 +31,79 @@ KDF_R = 8
 KDF_P = 1
 KEY_LEN = 32
 DEFAULT_PORTS = {"http": 80, "https": 443}
+# The store file is writable by the service user, so its KDF parameters are
+# untrusted input. Cap the scrypt cost to keep a tampered file from OOMing the
+# daemon or silently downgrading the KDF.
+MAX_KDF_N = 2 ** 16
+MAX_KDF_R = 8
+MAX_KDF_P = 4
+
+# mlock is a libc call, not a Python API. Resolve it once; a platform without it
+# is a hard failure rather than a silently unfulfilled security claim.
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _MLOCK = _LIBC.mlock
+    _MLOCK.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    _MLOCK.restype = ctypes.c_int
+    _MUNLOCK = _LIBC.munlock
+    _MUNLOCK.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    _MUNLOCK.restype = ctypes.c_int
+except (AttributeError, OSError):  # pragma: no cover - non-Linux
+    _MLOCK = None
+    _MUNLOCK = None
+
+
+class _LockedKey:
+    """The DEK, held in an mlock'd bytearray that is zeroed before release.
+
+    ``mlock`` failure is fatal: continuing unlocked would keep the key eligible
+    for swap and make the mlock claim a lie. ``LimitMEMLOCK=infinity`` in the
+    systemd unit gives the service the headroom it needs.
+    """
+
+    def __init__(self, raw: bytes | bytearray):
+        self._buf: bytearray | None = bytearray(raw)
+        self._len = len(self._buf)
+        self._addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+        self._locked = False
+        if _MLOCK is None:
+            raise VaultError("mlock is unavailable on this platform")
+        if _MLOCK(ctypes.c_void_p(self._addr), ctypes.c_size_t(self._len)) != 0:
+            errno = ctypes.get_errno()
+            raise VaultError("could not lock the data key in memory (mlock errno %d)" % errno)
+        self._locked = True
+        self.locked = True
+
+    @property
+    def buffer(self) -> bytearray:
+        assert self._buf is not None
+        return self._buf
+
+    def wipe(self) -> None:
+        if self._buf is None:
+            return
+        ctypes.memset(ctypes.c_void_p(self._addr), 0, self._len)
+        if self._locked and _MUNLOCK is not None:
+            _MUNLOCK(ctypes.c_void_p(self._addr), ctypes.c_size_t(self._len))
+        self._locked = False
+        self.locked = False
+        self._buf = None
+
+    def __del__(self):  # pragma: no cover - interpreter shutdown
+        try:
+            self.wipe()
+        except Exception:
+            pass
+
+
+def _wipe(buf: bytearray) -> None:
+    """Zero a temporary key buffer that is not the long-lived DEK."""
+    if buf:
+        ctypes.memset(
+            ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(buf))),
+            0,
+            len(buf),
+        )
 
 
 class VaultError(Exception):
@@ -50,6 +124,10 @@ def normalize_origin(value: str) -> str:
     host = (parts.hostname or "").lower()
     if not scheme or not host:
         raise VaultError("could not parse an origin from %r" % value)
+    if scheme not in DEFAULT_PORTS:
+        raise VaultError("origin must use http or https")
+    if parts.username or parts.password:
+        raise VaultError("origin must not contain credentials")
     try:
         port = parts.port
     except ValueError as exc:
@@ -99,7 +177,7 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = threading.RLock()
-        self._dek: bytearray | None = None
+        self._dek: _LockedKey | None = None
 
     # -- state ------------------------------------------------------------
     @property
@@ -110,27 +188,30 @@ class Store:
     def unlocked(self) -> bool:
         return self._dek is not None
 
-    def _require_unlocked(self) -> bytes:
+    def _require_unlocked(self) -> bytearray:
+        """Return the mlock'd key buffer itself — never a ``bytes`` copy."""
         if self._dek is None:
             raise LockedError("vault is locked; unlock it with the passphrase first")
-        return bytes(self._dek)
+        return self._dek.buffer
 
     def lock(self) -> None:
         with self._lock:
             if self._dek is not None:
-                for i in range(len(self._dek)):
-                    self._dek[i] = 0
+                self._dek.wipe()
             self._dek = None
 
     # -- crypto -----------------------------------------------------------
     @staticmethod
-    def _kek(passphrase: str, salt: bytes, n: int = KDF_N, r: int = KDF_R, p: int = KDF_P) -> bytes:
+    def _kek(passphrase: str, salt: bytes, n: int = KDF_N, r: int = KDF_R, p: int = KDF_P) -> bytearray:
         # OpenSSL's default scrypt memory ceiling is 32 MiB, which is exactly
-        # what n=2**15 / r=8 needs; ask for headroom explicitly.
-        return hashlib.scrypt(
+        # what n=2**15 / r=8 needs; ask for headroom explicitly. The caller wipes
+        # this buffer as soon as the DEK has been wrapped/unwrapped.
+        if not (1 <= n <= MAX_KDF_N and 1 <= r <= MAX_KDF_R and 1 <= p <= MAX_KDF_P):
+            raise VaultError("KDF parameters out of range")
+        return bytearray(hashlib.scrypt(
             passphrase.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=KEY_LEN,
             maxmem=128 * r * n + 16 * 1024 * 1024,
-        )
+        ))
 
     def _read_file(self) -> dict:
         if not self.path.exists():
@@ -156,25 +237,29 @@ class Store:
                 raise VaultError("store already exists")
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-            dek = os.urandom(KEY_LEN)
+            dek = bytearray(os.urandom(KEY_LEN))
             salt = os.urandom(16)
             kek = self._kek(passphrase, salt)
-            wrap_nonce = os.urandom(12)
-            wrapped = AESGCM(kek).encrypt(wrap_nonce, dek, b"hermes-vault-dek-v1")
-            body_nonce = os.urandom(12)
-            body = AESGCM(dek).encrypt(body_nonce, b'{"items": []}', b"hermes-vault-body-v1")
-            self._write_file(
-                {
-                    "magic": MAGIC,
-                    "kdf": {"n": KDF_N, "r": KDF_R, "p": KDF_P},
-                    "salt": _b64(salt),
-                    "wrap_nonce": _b64(wrap_nonce),
-                    "wrapped_dek": _b64(wrapped),
-                    "body_nonce": _b64(body_nonce),
-                    "body": _b64(body),
-                }
-            )
-            self._dek = bytearray(dek)
+            try:
+                wrap_nonce = os.urandom(12)
+                wrapped = AESGCM(kek).encrypt(wrap_nonce, dek, b"hermes-vault-dek-v1")
+                body_nonce = os.urandom(12)
+                body = AESGCM(dek).encrypt(body_nonce, b'{"items": []}', b"hermes-vault-body-v1")
+                self._write_file(
+                    {
+                        "magic": MAGIC,
+                        "kdf": {"n": KDF_N, "r": KDF_R, "p": KDF_P},
+                        "salt": _b64(salt),
+                        "wrap_nonce": _b64(wrap_nonce),
+                        "wrapped_dek": _b64(wrapped),
+                        "body_nonce": _b64(body_nonce),
+                        "body": _b64(body),
+                    }
+                )
+                self._dek = _LockedKey(dek)
+            finally:
+                _wipe(kek)
+                _wipe(dek)
 
     def unlock(self, passphrase: str) -> None:
         from cryptography.exceptions import InvalidTag
@@ -193,12 +278,16 @@ class Store:
                     r=int(params.get("r", KDF_R)),
                     p=int(params.get("p", KDF_P)),
                 )
-                dek = AESGCM(kek).decrypt(
-                    _unb64(doc["wrap_nonce"]), _unb64(doc["wrapped_dek"]), b"hermes-vault-dek-v1"
-                )
+                try:
+                    dek_plain = AESGCM(kek).decrypt(
+                        _unb64(doc["wrap_nonce"]), _unb64(doc["wrapped_dek"]), b"hermes-vault-dek-v1"
+                    )
+                finally:
+                    _wipe(kek)
             except (InvalidTag, KeyError, ValueError) as exc:
                 raise VaultError("wrong passphrase") from exc
-            self._dek = bytearray(dek)
+            # A failed mlock is a hard error of its own, not a wrong passphrase.
+            self._dek = _LockedKey(dek_plain)
 
     # -- items ------------------------------------------------------------
     def _load_items(self) -> list[dict]:

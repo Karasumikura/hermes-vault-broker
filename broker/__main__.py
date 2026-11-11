@@ -8,7 +8,7 @@
     python -m broker add --label kaggle --origin https://www.kaggle.com --identifier me@example.com
     python -m broker remove --handle vault_...
     python -m broker fill --handle vault_... --origin https://www.kaggle.com [--submit]
-    python -m broker migrate --key vault.key --enc vault.json.enc
+    python -m broker migrate --json my-export.json
 
 ``add`` and ``init`` read the secret from the terminal (getpass), never from
 argv, so it does not land in the process list or the shell history.
@@ -86,27 +86,41 @@ def _cmd_add(args) -> int:
 
 
 def _cmd_migrate(args) -> int:
-    """Import items from a Hermes ``vault.key`` + ``vault.json.enc`` pair (or plain JSON)."""
-    if args.json:
-        items = json.load(open(args.json, encoding="utf-8")).get("items", [])
-    else:
-        from cryptography.fernet import Fernet
+    """Import logins from a JSON file the operator exported themselves.
 
-        key = open(args.key, "rb").read().strip()
-        blob = open(args.enc, "rb").read()
-        items = json.loads(Fernet(key).decrypt(blob).decode("utf-8")).get("items", [])
+    The broker must not read Hermes's own credential stores (``vault.key`` /
+    ``vault.json.enc``): a plugin has no business opening them. Whoever owns the
+    data exports it to a file first and points this command at that file.
+    """
+    if not args.json:
+        print("--json is required; export the items yourself first", file=sys.stderr)
+        return 2
+    try:
+        with open(args.json, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print("cannot read the export (%s)" % type(exc).__name__, file=sys.stderr)
+        return 1
+    items = doc.get("items", []) if isinstance(doc, dict) else []
+    if not isinstance(items, list):
+        print("the export must contain an 'items' list", file=sys.stderr)
+        return 1
 
     migrated = 0
     for item in items:
-        if item.get("kind", "login") != "login":
+        if not isinstance(item, dict) or item.get("kind", "login") != "login":
             continue
+        secret = item.get("secret") or {}
+        password_value = ""
+        if isinstance(secret, dict):
+            password_value = secret.get("password") or ""
         request = {
             "op": "add",
             "label": item.get("label") or "imported",
             "origin": item.get("origin") or "",
             "identifier_type": item.get("identifier_type") or "email",
             "identifier": item.get("identifier") or "",
-            "password": (item.get("secret") or {}).get("password") or "",
+            "password": password_value,
         }
         try:
             reply = call(request, socket_path=args.socket)
@@ -133,8 +147,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon_parser = sub.add_parser("daemon")
     daemon_parser.add_argument("--allow-uid", action="append", type=int, default=None)
+    daemon_parser.add_argument("--cdp-config", default=daemon_module.DEFAULT_CONFIG_PATH)
     daemon_parser.set_defaults(func=lambda a: daemon_module.main(
-        ["--socket", a.socket, "--state", a.state]
+        ["--socket", a.socket, "--state", a.state, "--cdp-config", a.cdp_config]
         + sum([["--allow-uid", str(u)] for u in (a.allow_uid or [])], [])
     ))
 
@@ -168,17 +183,22 @@ def build_parser() -> argparse.ArgumentParser:
     fill = sub.add_parser("fill")
     fill.add_argument("--handle", required=True)
     fill.add_argument("--origin", required=True)
-    fill.add_argument("--cdp", default="http://127.0.0.1:9223")
     fill.add_argument("--submit", action="store_true")
     fill.set_defaults(func=lambda a: _print(call(
-        {"op": "fill", "handle": a.handle, "origin": a.origin, "cdp": a.cdp, "submit": a.submit},
+        {"op": "fill", "handle": a.handle, "origin": a.origin, "submit": a.submit},
         socket_path=a.socket,
     )))
 
-    migrate = sub.add_parser("migrate")
-    migrate.add_argument("--key", default="")
-    migrate.add_argument("--enc", default="")
-    migrate.add_argument("--json", default="")
+    migrate = sub.add_parser(
+        "migrate",
+        help="import logins from a JSON export the operator made themselves",
+    )
+    migrate.add_argument(
+        "--json",
+        required=True,
+        metavar="EXPORT.json",
+        help='JSON file with {"items": [{"label", "origin", "identifier", "secret": {"password"}}]}',
+    )
     migrate.set_defaults(func=_cmd_migrate)
     return parser
 
