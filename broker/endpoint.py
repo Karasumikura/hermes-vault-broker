@@ -42,6 +42,14 @@ class Endpoint:
         return self.base + "/json/list"
 
 
+@dataclass(frozen=True)
+class PipeConfig:
+    """The broker launches and owns its own browser; CDP travels over fd 3/4."""
+
+    browser: str
+    args: tuple[str, ...] = ()
+
+
 def _canonical_host(host: str) -> str:
     """Normalise the two spellings of the IPv4 loopback to one value."""
     return "127.0.0.1" if host.lower() == "localhost" else host.lower()
@@ -145,7 +153,19 @@ def _check_config_file(path: Path) -> None:
     _check_stat(st)
 
 
-def load_config(path: str = DEFAULT_CONFIG_PATH) -> Endpoint:
+def _pipe_config(doc: dict) -> PipeConfig:
+    browser = doc.get("browser")
+    if not isinstance(browser, str) or not os.path.isabs(browser):
+        raise EndpointError("pipe mode needs an absolute browser path")
+    if not os.path.isfile(browser) or not os.access(browser, os.X_OK):
+        raise EndpointError("the configured browser is not executable")
+    args = doc.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise EndpointError("pipe mode args must be a list of strings")
+    return PipeConfig(browser=browser, args=tuple(args))
+
+
+def load_config(path: str = DEFAULT_CONFIG_PATH) -> Endpoint | PipeConfig:
     """Read ``{"cdp": "http://127.0.0.1:9223"}`` from a root-owned file.
 
     ``O_NOFOLLOW`` + ``fstat(fd)`` + reading through that same fd removes the
@@ -173,6 +193,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> Endpoint:
             os.close(fd)
     if not isinstance(doc, dict):
         raise EndpointError("the DevTools config must be a JSON object")
+    if doc.get("mode") == "pipe":
+        return _pipe_config(doc)
     url = doc.get("cdp")
     if not isinstance(url, str):
         raise EndpointError("the DevTools config must contain a string 'cdp'")

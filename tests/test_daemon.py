@@ -8,7 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from broker import daemon  # noqa: E402
-from broker.endpoint import validate_base  # noqa: E402
+from broker.endpoint import PipeConfig, validate_base  # noqa: E402
 from broker.store import Store  # noqa: E402
 
 PASS = "correct horse battery staple"
@@ -184,6 +184,59 @@ class PerOperationUidTest(unittest.TestCase):
             0,
         )
         self.assertTrue(reply["ok"])
+
+
+class PipeDispatchTest(unittest.TestCase):
+    """Pipe mode routes fills to the broker-owned browser, never to HTTP/WS."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        store = Store(os.path.join(self.tmp.name, "store.json"))
+        store.create(PASS)
+        self.broker = daemon.Broker(
+            store,
+            allowed_uids=(0,),
+            pipe_config=PipeConfig("/bin/true", ("about:blank",)),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _handle(self):
+        return self.broker.handle(
+            {
+                "op": "add",
+                "label": "kaggle",
+                "origin": "https://www.kaggle.com",
+                "identifier_type": "email",
+                "identifier": "me@example.com",
+                "password": "pw-value",
+            },
+            0,
+        )["handle"]
+
+    def test_fill_goes_through_the_broker_owned_browser(self):
+        handle = self._handle()
+        browser = object()
+        with mock.patch.object(self.broker, "_browser", return_value=browser), mock.patch.object(
+            daemon.cdp_module, "fill_login_pipe", return_value={"filled": 1, "submitted": False}
+        ) as fill:
+            out = self.broker.handle(
+                {"op": "fill", "handle": handle, "origin": "https://www.kaggle.com"}, 0
+            )
+        self.assertTrue(out["ok"])
+        self.assertIs(fill.call_args.kwargs["transport"], browser)
+        self.assertEqual(fill.call_args.kwargs["password"], "pw-value")
+
+    def test_http_fill_is_not_used_in_pipe_mode(self):
+        handle = self._handle()
+        with mock.patch.object(self.broker, "_browser", return_value=object()), mock.patch.object(
+            daemon.cdp_module, "fill_login_pipe", return_value={"filled": 1, "submitted": False}
+        ), mock.patch.object(daemon.cdp_module, "fill_login") as http_fill:
+            self.broker.handle(
+                {"op": "fill", "handle": handle, "origin": "https://www.kaggle.com"}, 0
+            )
+        http_fill.assert_not_called()
 
 
 if __name__ == "__main__":

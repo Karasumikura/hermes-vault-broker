@@ -62,6 +62,16 @@ The agent's tool result is a count. There is no code path that returns the passw
 - **validated as loopback** (`http` + IPv4 loopback + explicit port, no path/query/userinfo)
 - **re-checked against the tab**: any `webSocketDebuggerUrl` whose `host:port` differs from the configured endpoint is refused before anything is sent. The websocket URL is rebuilt from the validated IP literal, redirects are refused, and the connection bypasses environment proxies entirely.
 
+### Broker-owned browser (CDP pipe)
+
+The same root-owned config can place the browser channel itself inside the trust domain:
+
+```json
+{"mode": "pipe", "browser": "/usr/bin/chromium", "args": ["about:blank"]}
+```
+
+The broker then launches and owns Chromium and speaks CDP over file descriptors 3/4 of that process. There is no TCP debugging port, no `/json/list` endpoint and no websocket URL: tabs are addressed by target id inside the broker's own browser. When a credential is filled, the broker opens that credential's bound origin in its own browser — the destination comes from the store, not from the model. Every pipe message is bounded and each tab keeps a single DevTools session. The same exact-origin check, native value setter, `input`/`change` events and `requestSubmit()` path apply. `broker/pipe.py` is covered by real Chromium round trips that navigate to a page, write a password into a live input field, and re-assert the origin inside the page before writing.
+
 ### Wire format
 
 One JSON object per line, one request per connection:

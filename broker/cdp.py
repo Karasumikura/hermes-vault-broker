@@ -189,6 +189,11 @@ def fill_login(
         "submit": "true" if submit else "false",
     }
     reply = _evaluate(ws_url, expression)
+    return _parse_reply(reply, origin)
+
+
+def _parse_reply(reply: dict, origin: str) -> dict:
+    """Turn a Runtime.evaluate reply into ``{filled, submitted}``."""
     if not isinstance(reply, dict):
         raise CdpError("the DevTools endpoint returned an unexpected reply")
     if "error" in reply:
@@ -218,3 +223,38 @@ def fill_login(
     except (TypeError, ValueError):
         raise CdpError("the page returned an unreadable result") from None
     return {"filled": filled, "submitted": bool(parsed.get("submitted"))}
+
+
+def fill_login_pipe(origin: str, password: str, transport, submit: bool = False) -> dict:
+    """Fill through a broker-owned browser speaking CDP over a pipe.
+
+    There is no websocket URL and no TCP port: the tab is addressed by its
+    target id inside the browser the broker itself launched.
+    """
+    if not password:
+        raise CdpError("no password to fill")
+    wanted = origin.rstrip("/")
+    pages = [t for t in transport.list_tabs() if t.get("type") == "page"]
+    tab = next((t for t in pages if origin_of(t.get("url", "")) == wanted), None)
+    if tab is None and pages and getattr(transport, "navigate", None):
+        # The broker owns this browser, so it opens the credential's bound
+        # origin itself; the destination comes from the store, not the model.
+        try:
+            transport.navigate(pages[0].get("id"), origin)
+            pages = [t for t in transport.list_tabs() if t.get("type") == "page"]
+            tab = next((t for t in pages if origin_of(t.get("url", "")) == wanted), None)
+        except Exception as exc:  # noqa: BLE001 - surface by type, never by content
+            raise CdpError("DevTools navigation failed: %s" % type(exc).__name__) from exc
+    if tab is None:
+        seen = ", ".join(sorted({origin_of(t.get("url", "")) for t in pages})[:5])[:200] or "none"
+        raise CdpError("no open tab on %s (open tabs: %s)" % (wanted, seen))
+    expression = _FILL_JS % {
+        "origin": json.dumps(origin),
+        "password": json.dumps(password),
+        "submit": "true" if submit else "false",
+    }
+    try:
+        reply = transport.evaluate(tab.get("id"), expression)
+    except Exception as exc:  # noqa: BLE001 - transport failures are safe to surface by type
+        raise CdpError("DevTools evaluation failed: %s" % type(exc).__name__) from exc
+    return _parse_reply(reply, origin)

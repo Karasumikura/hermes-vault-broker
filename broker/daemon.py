@@ -34,7 +34,7 @@ import threading
 import time
 
 from . import cdp as cdp_module
-from .endpoint import DEFAULT_CONFIG_PATH, Endpoint, EndpointError, load_config
+from .endpoint import DEFAULT_CONFIG_PATH, Endpoint, EndpointError, PipeConfig, load_config
 from .store import LockedError, Store, VaultError
 
 log = logging.getLogger("hermes-vault-broker")
@@ -71,15 +71,36 @@ class Broker:
         allowed_uids: tuple[int, ...] = (0,),
         admin_uids: tuple[int, ...] | None = None,
         endpoint: Endpoint | None = None,
+        pipe_config: PipeConfig | None = None,
     ):
         self.store = store
         self.allowed_uids = tuple(allowed_uids)
         # Only root and the broker's own uid may mutate or unlock the store.
         self.admin_uids = tuple(admin_uids) if admin_uids is not None else (0, os.getuid())
         self.endpoint = endpoint
+        self.pipe_config = pipe_config
+        self._pipe_transport = None
+        self._transport_lock = threading.Lock()
         self._failures = 0
         self._blocked_until = 0.0
         self._mutex = threading.Lock()
+
+    def _browser(self):
+        """Lazily start the broker-owned browser, once, for the pipe mode."""
+        assert self.pipe_config is not None
+        with self._transport_lock:
+            if self._pipe_transport is None:
+                from .pipe import PipeTransport
+
+                try:
+                    self._pipe_transport = PipeTransport(
+                        self.pipe_config.browser, self.pipe_config.args
+                    )
+                except Exception as exc:  # noqa: BLE001 - surface by type, never by content
+                    raise cdp_module.CdpError(
+                        "cannot start the broker-owned browser (%s)" % type(exc).__name__
+                    ) from exc
+            return self._pipe_transport
 
     # -- entry point ------------------------------------------------------
     def handle(self, request: dict, uid: int) -> dict:
@@ -177,17 +198,26 @@ class Broker:
         # fails loudly.
         if "cdp" in request:
             return {"ok": False, "error": "cdp is not accepted; the broker owns its DevTools endpoint"}
-        if self.endpoint is None:
+        if self.endpoint is None and self.pipe_config is None:
             return {"ok": False, "error": "no DevTools endpoint configured"}
         handle = request.get("handle") or ""
         origin = request.get("origin") or ""
         meta, password = self.store.resolve(handle, origin)
-        result = cdp_module.fill_login(
-            origin=meta.origin,
-            password=password,
-            endpoint=self.endpoint,
-            submit=bool(request.get("submit")),
-        )
+        if self.pipe_config is not None:
+            result = cdp_module.fill_login_pipe(
+                origin=meta.origin,
+                password=password,
+                transport=self._browser(),
+                submit=bool(request.get("submit")),
+            )
+        else:
+            assert self.endpoint is not None
+            result = cdp_module.fill_login(
+                origin=meta.origin,
+                password=password,
+                endpoint=self.endpoint,
+                submit=bool(request.get("submit")),
+            )
         log.info("filled %s on %s (%s fields)", meta.id, meta.origin, result.get("filled"))
         return {"ok": True, "handle": meta.id, "origin": meta.origin, **result}
 
@@ -241,10 +271,13 @@ def serve(
     socket_path: str,
     state_path: str,
     allowed_uids: tuple[int, ...],
-    endpoint: Endpoint,
+    endpoint: Endpoint | None,
+    pipe_config: PipeConfig | None,
 ) -> None:
     store = Store(state_path)
-    broker = Broker(store, allowed_uids=allowed_uids, endpoint=endpoint)
+    broker = Broker(
+        store, allowed_uids=allowed_uids, endpoint=endpoint, pipe_config=pipe_config
+    )
     server = Server(socket_path, broker)
     log.info("listening on %s (state %s)", socket_path, state_path)
     try:
@@ -276,14 +309,16 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
     try:
-        endpoint = load_config(args.cdp_config)
+        config = load_config(args.cdp_config)
     except EndpointError as exc:
         log.error("refusing to start: %s", exc)
         return 2
+    endpoint = config if isinstance(config, Endpoint) else None
+    pipe_config = config if isinstance(config, PipeConfig) else None
     admins = (0, os.getuid())
     allowed = tuple(dict.fromkeys(admins + tuple(args.allow_uid or [])))
     try:
-        serve(args.socket, args.state, allowed, endpoint)
+        serve(args.socket, args.state, allowed, endpoint, pipe_config)
     except KeyboardInterrupt:
         return 0
     return 0

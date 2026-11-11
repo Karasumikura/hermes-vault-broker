@@ -85,6 +85,8 @@ class ConfigFileTest(unittest.TestCase):
             path.write_text(json.dumps({"cdp": "http://127.0.0.1:9223"}), encoding="utf-8")
             with mock.patch.object(ep, "_check_parent", return_value=None), mock.patch.object(ep, "_check_stat", return_value=None):
                 loaded = ep.load_config(str(path))
+            self.assertIsInstance(loaded, ep.Endpoint)
+            assert isinstance(loaded, ep.Endpoint)
             self.assertEqual(loaded.port, 9223)
 
     def test_load_config_rejects_bad_documents(self):
@@ -161,6 +163,44 @@ class ConfigFileTest(unittest.TestCase):
     def test_missing_config_is_refused(self):
         with self.assertRaises(ep.EndpointError):
             ep._check_config_file(Path("/definitely/not/here/cdp.json"))
+
+
+class PipeConfigTest(unittest.TestCase):
+    def test_pipe_mode_is_accepted(self):
+        import sys
+
+        browser = os.path.abspath(sys.executable)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cdp.json"
+            path.write_text(json.dumps({
+                "mode": "pipe", "browser": browser, "args": ["about:blank"],
+            }), encoding="utf-8")
+            with mock.patch.object(ep, "_check_parent", return_value=None), mock.patch.object(ep, "_check_stat", return_value=None):
+                config = ep.load_config(str(path))
+        self.assertIsInstance(config, ep.PipeConfig)
+        assert isinstance(config, ep.PipeConfig)
+        self.assertEqual(config.browser, browser)
+        self.assertEqual(config.args, ("about:blank",))
+
+    def test_pipe_mode_validates_browser_and_args(self):
+        import sys
+
+        browser = os.path.abspath(sys.executable)
+        bad_docs = [
+            {"mode": "pipe", "browser": "chromium"},
+            {"mode": "pipe", "browser": "/definitely/not/here"},
+            {"mode": "pipe", "browser": browser, "args": "about:blank"},
+            {"mode": "pipe", "browser": browser, "args": [1]},
+            {"mode": "pipe"},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cdp.json"
+            for doc in bad_docs:
+                with self.subTest(doc=doc):
+                    path.write_text(json.dumps(doc), encoding="utf-8")
+                    with mock.patch.object(ep, "_check_parent", return_value=None), mock.patch.object(ep, "_check_stat", return_value=None):
+                        with self.assertRaises(ep.EndpointError):
+                            ep.load_config(str(path))
 
 
 if __name__ == "__main__":
